@@ -1,0 +1,441 @@
+---
+title: "Statistik II Klausur"
+author: "Anastasiia Tiurina"
+date: "06.09.2021"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse, tableone, PerformanceAnalytics, reshape2, ggpubr,
+               lme4, stats, lmtest, plyr, broom, magrittr, car, pwr, readxl,
+               blorr)
+```
+
+## Teil 1: Datenanalyse in R
+
+**Endpunkt:** POD genestet in clinic
+
+### Kausales Modell
+
+**Fragestellung:**
+
+-   Wie unterscheidet sich POD in sechs verschiedenen Kliniken?
+-   Welche Variablen beeinflussen die Entstehung von POD?
+
+#### Data
+
+-   Daten lesen und reinigen:
+    -   Zeichen in Faktoren umwandeln
+    -   Dauer anstelle von Start und Ende verwenden
+
+```{r data, comment=''}
+clinical_data <- read.csv(file = 'clinical_data.csv')
+
+head(clinical_data)
+str(clinical_data)
+
+categorical_variables <- c("gender", "frailty", "surgery", "ISCED", "pet", "ASA", "clinic", "complication", "POD")
+
+clinical_data <- as_tibble(clinical_data) %>% 
+  mutate(across(all_of(catVars), as_factor),
+         frailty = 
+           factor(frailty, levels = c("robuts", "pre-frail", "frail")),
+         ISCED = factor(ISCED, levels = c("II", "III", "IV", "V", "VI")),
+         ASA = factor(ASA, levels = c("II", "III", "IV", "V", "VI")),
+         POD = factor(POD),
+         complication = factor(complication),
+         gender = factor(gender))
+
+clinical_data$anae_start <- as.POSIXct(clinical_data$anae_start,
+                                     format = "%Y-%m-%dT%H:%M:%SZ")
+clinical_data$anae_end <- as.POSIXct(clinical_data$anae_end,
+                                   format = "%Y-%m-%dT%H:%M:%SZ")
+clinical_data$duration_mins <- difftime(clinical_data$anae_end, 
+                                      clinical_data$anae_start, 
+                                      units = "mins") %>%
+  as.numeric()
+
+clinical_data <-  dplyr::select(clinical_data, -anae_start, -anae_end)
+
+head(clinical_data)
+
+str(clinical_data)
+```
+
+#### Table 1 and Missing Values
+
+```{r table one, comment='', warning=FALSE}
+variables <- sort(names(clinical_data))
+variables
+
+table_one <- CreateTableOne(vars = variables,
+                            strata = 'POD',
+                            data = clinical_data,
+                            factorVars = categorical_variables)
+print(table_one, showAllLevels = TRUE)
+
+summary(table_one)
+```
+
+-   Keine fehlenden Werten
+-   Alle kontinuierliche Variablen scheinen normalverteilt zu sein
+
+#### EDA
+
+**Check continuous variables**
+
+```{r eda1, comment='', warning=FALSE}
+continuous_data <- clinical_data %>%
+  select_if(is.numeric)
+
+chart.Correlation(continuous_data,
+                  method = "pearson",
+                  histogram = TRUE,
+                  pch = 16)
+```
+
+-   bloodpressure, height and weight sind hoch korreliert -\> eine
+    Variable für weitere Analyse wählen
+-   bloodpressure, height, weight and duration_mins sind nicht
+    normalverteilt (outliers?)
+
+**To see how binary variables change over levels of continuous variables
+-\> look at the distribution of continuous variables at each level of
+the binary outcome**
+
+```{r eda2, comment='', warning=FALSE}
+dput(sort(names(continuous_data)))
+continuous_variables <- sort(names(continuous_data))
+continuous_variables
+pod_id <- melt(clinical_data[, c("POD", "activity", "age", "bloodpressure",
+                               "creatinin", "CRP", "duration_mins", "height",
+                               "weight")], 
+               id.vars="POD")
+box_plots <- ggplot(pod_id, aes(factor(POD), y = value, fill=factor(POD))) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+box_plots
+boxplot_stats <- ggplot_build(box_plots)$data[[1]]
+boxplot_stats$ymin
+boxplot_stats$ymax
+clean_data <- clinical_data %>%
+  filter(bloodpressure >= 101.3280608, height >= 174)
+pod_id <- melt(clean_data[, c("POD", "activity", "age", "bloodpressure",
+                               "creatinin", "CRP", "duration_mins", "height",
+                               "weight")], 
+               id.vars="POD")
+ggplot(pod_id, aes(factor(POD), y = value, fill=factor(POD))) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+
+clean_continuous_data <- clean_data %>%
+  select_if(is.numeric)
+
+chart.Correlation(clean_continuous_data,
+                  method = "pearson",
+                  histogram = TRUE,
+                  pch = 16)
+```
+
+Aus diesem Plot kann man sehen, dass es wahrscheinlich kein Zusammenhang
+mit allen anderen Variablen außer duration_mins gibt. Es kann sein, dass
+je länger die Operation dauert, desto größer Wahrscheinlichkeit ist,
+dass POD entsteht.
+
+**Outliers löschen**
+
+```{r Outliers, comment='', warning=FALSE}
+clean_data$id <- seq.int(nrow(clean_continuous_data))
+
+multi_dim_scaled_data <- clean_continuous_data %>%
+  dist() %>%
+  cmdscale() %>%
+  as_tibble() %>%
+  set_names(c("dim_1", "dim_2")) %>%
+  mutate(id = clean_data$id)
+           
+ggscatter(multi_dim_scaled_data, x = "dim_1", y = "dim_2",
+          label = clean_data$clinic,
+          size = 1,
+          repel = TRUE)
+
+wanted <- multi_dim_scaled_data %>%
+  filter(dim_1 > -65) %>%
+  pull(id)
+
+clean_data <- clean_data %>%
+  filter(id %in% wanted)
+
+multi_dim_scaled_clean_data <- clean_data %>%
+  select(-id) %>% 
+  dist() %>%          
+  cmdscale() %>%
+  as_tibble() %>%
+  set_names(c("dim_1", "dim_2")) %>%
+  mutate(id = clean_data$id)
+
+ggscatter(multi_dim_scaled_clean_data, x = "dim_1", y = "dim_2",
+          label = clean_data$clinic,
+          size = 1,
+          repel = TRUE)
+table(clean_data$POD)
+table(clean_data$ASA)
+table(clean_data$frailty)
+
+
+clean_data %>%
+  mutate(ASA = factor(ASA, levels = c("II", "III", "IV", "V")))
+clean_continuous_data <- clean_data %>%
+  select_if(is.numeric) %>%
+  select(-id)
+
+chart.Correlation(clean_continuous_data,
+                  method = "pearson",
+                  histogram = TRUE,
+                  pch = 16)
+```
+
+#### Passende Regression zum Endpunkt
+
+POD ist binär -\> logistische Regression
+
+POD ist genestet in Klinik -\> gemischtes Modell
+
+**Passende Regression:** mixed effects logistic regression
+
+**Nullmodell**
+
+null model: no fixed or random effects, just the intercept
+
+```{r nullmodel, comment='', warning=FALSE}
+null_model <- glm(POD ~ 1,
+                  family = binomial,
+                  data = clean_data)
+summary(null_model)
+
+
+mixed_null_model <- glmer(POD ~ 1 + (1|clinic),
+                          data = clean_data,
+                          family = binomial,
+                          control = glmerControl(optimizer = "bobyqa"),
+                          nAGQ = 0)
+summary(mixed_null_model)
+```
+
+Effektschätzer zeigt, dass es wahrscheinlicher keine POD zu haben, da ES
+negativ ist
+
+How much random intercept varies by clinic. practicly 0, probably
+Intercept don't vary by clinic
+
+-\> Muss man nicht mixed effects messen, dann nur logistische Regression
+
+**Fullmodell**
+
+```{r fullmodel1, comment='', warning=FALSE}
+full_model.1 <- glm(POD ~ age + activity + frailty + surgery + bloodpressure +
+                      height + weight + creatinin + ISCED + pet + CRP + ASA +
+                      complication + duration_mins,
+                    data = clean_data, family = binomial)
+summary(full_model.1)
+```
+
+**Variablenselektion nach p-Wert**
+
+```{r fullmodel3, comment='', warning=FALSE}
+dput(names(clean_data))
+risk_vector <- c("age", "activity", "frailty", "surgery", "bloodpressure", 
+              "creatinin", "weight", "height", "ISCED", "pet", "CRP", "ASA",
+              "complication", "duration_mins")
+
+univariat_fit_table <- ldply(risk_vector, function(x) {
+  tmp_tbl <- clean_data %>%
+    select(POD, x)
+  tmp_formula <- reformulate(termlabels = x,
+                             response = "POD")
+  tmp_fit <- glm(tmp_formula, data = tmp_tbl, family = binomial) %>%
+    tidy %>%
+    magrittr::extract(-1,)
+  return(tmp_fit)
+}) %>% as_tibble
+
+selected_risk_vector <- univariat_fit_table %>%
+  filter(p.value <= 0.05) %>%
+  pull(term) %>% print()
+
+
+full_model.2 <- glm(POD ~ frailty + complication + duration_mins + pet,
+                      data = clean_data, family = binomial)
+summary(full_model.2)
+tidy(full_model.2, exponentiate = TRUE)
+summary(full_model.2)$deviance / summary(full_model.2)$df.residual
+raintest(full_model.2)
+vif(full_model.2)
+```
+
+raintest - linearität signifikant vif - keine multikollinearität
+
+```{r fullmodel4, comment='', warning=FALSE}
+MASS::stepAIC(full_model.1, direction = "backward") %>% summary
+full_model.3 <- glm(formula = POD ~ frailty + bloodpressure + ASA + duration_mins,
+                    family = binomial, data = clean_data)
+summary(full_model.3)
+tidy(full_model.3, exponentiate = TRUE)
+raintest(full_model.3)
+vif(full_model.3)
+final_model <- glm(formula = POD ~ frailty + bloodpressure + duration_mins,
+                    family = binomial, data = clean_data)
+summary(final_model) 
+tidy(final_model)
+# CHECK OVERDISPERSION (muss kleiner 1.5 sein)
+summary(final_model)$deviance / summary(final_model)$df.residual
+raintest(final_model)
+vif(final_model)
+
+anova(null_model, full_model.1, full_model.3, final_model, test = 'LR')
+anova(full_model.1, final_model, test = 'LR')
+
+tidy(final_model, exponentiate = TRUE, conf.int = TRUE)
+plot(fitted(final_model),
+     rstandard(final_model))
+
+```
+
+Bei logistischer Regression ist OR Effektschaetzer:
+
+OR = 1 , kein Zusammenhang OR \> 1, positive Zusammenhang (erhoehte
+Risiko für POD) OR \<1, negativer Zusammenhang, protektiv
+
+KI: 1 ist drin -\> H0 ablehnen
+
+### Vertiefendes Thema
+
+bloodpressure \~ gender
+
+Annahmen: bloodpressure kontinuierlich -\> t-Test, nicht normalverteilt
+-\> +15%
+
+Cohens d zum Unterschied zweier Mittelwerte aus unabhängigen Stichproben
+
+wie stark sich die Mittelwerte zweier Stichproben unterscheiden.
+
+```{r fallzahlplanung, comment='', warning=FALSE}
+ggplot(data = clinical_data, aes(x = gender, y = bloodpressure)) +
+  geom_boxplot()
+mean(clinical_data$bloodpressure)
+male <- clinical_data %>%
+  select(bloodpressure, gender) %>%
+  filter(gender == 'man')
+male_mean <- mean(male$bloodpressure)
+male_mean
+female <- clinical_data %>%
+  select(bloodpressure, gender) %>%
+  filter(gender == 'woman')
+female_mean <- mean(female$bloodpressure)
+female_mean
+male_sd <- sd(male$bloodpressure)
+female_sd <- sd(female$bloodpressure)
+sd_pooled <- sqrt((male_sd^2 + female_sd^2)/2)
+effect_size <- (male_mean - female_mean)/sd_pooled
+effect_size
+ggplot(clinical_data, aes(bloodpressure, fill = gender)) + geom_density(alpha = 0.2)
+pwr.t.test(d=effect_size, sig.level=0.05, power=0.80, type="two.sample", alternative="two.sided")
+round(2.360314*1.15,0)
+```
+
+Unterschiede:
+
+-   bei der Fallzahlplannung geht es um die Planung von der Größe der
+    Stichprobe mit dem Prinzip (so wenig wie nötig, so viel wie möglich)
+-   bei dem Ethikantrag müssen außer Stichprobegröße auch Notwendigkeit
+    von einem Tierexperiment gezeigt und mögliche Scnerzmildernde
+    Vornahmen vorgeschlagen
+
+Fallzahlplanung ist ein Teil von Ethinantrag
+
+# Teil 2
+
+1.  Was ist der grundlegende Unterschied zwischen parametrischer und
+    nicht-parametrischer Statistik. Geben Sie ein Beispiel am t-Test und
+    U-Test!
+
+Parametrische Statistik: Parameter einer Verteilung (zB Mittelwert oder
+SA)
+
+Nichtparametrische Statistik: Median und IQR -\> sortieren und Ränge
+zuordnen
+
+Parametrik: t-Test
+
+NP: U-Tets
+
+```{r np, comment='', warning=FALSE}
+tbl <- read_excel("C:/Users/trn13/statistik/anova_1factor.xlsx")
+clean_tbl <- tbl %>%
+  gather(treatment, weight) %>%
+  mutate(treatment = as.factor(treatment)) %>% 
+  na.omit %>%
+  filter(treatment %in% c("A", "B"))
+np_tbl <- clean_tbl %>%
+  arrange(weight) %>%
+  mutate(rank = 1:18)
+
+np_tbl %>%
+  group_by(treatment) %>%
+  dplyr::summarise(sum = sum(rank))
+
+wilcox.test(weight ~ treatment, data = clean_tbl)
+
+t.test(weight ~ treatment, data = clean_tbl)
+```
+
+2.  Warum müssen Sie die Effektschätzer einer logistischen Regression
+    transformieren? Welche Transformation wählen Sie? Geben Sie ein
+    Beispiel!
+
+Abweichung muss NV sein (von -Inf bis +Inf) -\> link Funktion: log(OR)
+-\> logit scale -\> Interpretationsfehler -\> zurück auf Response scale
+-\> exponieren
+
+3.  Skizzieren Sie eine ROC Kurve und erklären Sie an einem Beispiel,
+    wie es zu dem typischen Verlauf der ROC Kurve kommt! Warum wird die
+    ROC häufig im Bereich des maschinellen Lernens verwendet? Erklären
+    Sie den Kontext an einem Beispiel!
+
+```{r roc, comment='', warning=FALSE}
+final_model %>%
+  blr_gains_table() %>%
+  blr_roc_curve()
+```
+
+4.  Wieso ist es schwierig, Effektschätzer in einer ordinalen Regression
+    zu interpretieren? Geben Sie ein beispiel!
+
+Log Scale
+
+interpretation von ES ist vom Software abhängig
+
+außerdem viele interpretation
+
+bei der Interpretation der Ergebnisse können wir nur die niedrigste
+Stufe mit allen anderen Stufen vergleichen -\> künstlerisch erstellte
+binäre modell
+
+(\*) For students whose parents did attend college, the odds of being
+more likely (i.e., very or somewhat likely versus unlikely) to apply is
+2.85 times that of students whose parents did not go to college, holding
+constant all other variables.
+
+5.  Was ist der Unterschied zwischen der 'Adjustierung für den Fehler 1.
+    Art' und der 'Adjustierung der p-Werte'? Geben Sie je ein Beispiel!
+
+Adjustierung für den Fehler 1. Art: Signifikanzniveau durch Anzahl von
+Testen teilen -\> adjustierte SN BSP: 5 mal Testen -\> alph = 0.01
+
+H0 zu oft beibehalten (globale niveau deutlcich unter lokal)
+
+p-wert adj: p\*k\<alpha
